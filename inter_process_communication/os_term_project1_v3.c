@@ -9,6 +9,7 @@
     #include <errno.h>      // 시스템 오류 확인 : errno
     #include <signal.h>     // 시그널 처리 : kill() 등
     #include <string.h>     // 문자열 처리
+    #include <fcntl.h>      // 저수준 파일 제어 : open(), O_WRONLY 등
 
     #include <sys/types.h>  // 시스템 자료형 : pid_t
     #include <sys/ipc.h>    // IPC 관련 정의
@@ -17,15 +18,18 @@
     #include <sys/time.h>   // 시간 및 타이머 : settimer()
 
 // 2. 상수 정의
-    #define NUM_CHILDREN 10     // 생성할 자식 프로세스 개수 10개
-    #define TIME_QUANTUM 3      // RR 타임 퀸텀
-    #define MAX_TICKS 10000     // 총 시뮬레이션 타임 틱
+    #define NUM_CHILDREN 10             // 생성할 자식 프로세스 개수 10개
+    #define TIME_QUANTUM 3              // RR 타임 퀸텀
+    #define MAX_TICKS 10000             // 총 시뮬레이션 타임 틱
     #define MIN_CPU_BURST 3    
     #define MAX_CPU_BURST 9
     #define MIN_IO_BURST 2
     #define MAX_IO_BURST 6
-    #define AGING_THRESHOLD 10  // 에이징 발생 대기 시간
-    #define MSG_STOP -1         // 자식 프로세스 종료 메시지
+    #define AGING_THRESHOLD 10          // 에이징 발생 대기 시간
+    #define MSG_STOP -1                 // 자식 프로세스 종료 메시지
+    #define DUMP_QUEUE_BUF_SIZE 1024    // 큐 버퍼 사이즈 ( 파일 출력을 위해서 )
+    #define DUMP_OUTPUT_BUF_SIZE 4096   // 전체 출력 버퍼 사이즈 ( 파일 출력을 위해서 )
+    #define CHAR_BUF_SIZE 10            // 프로세스 번호 버퍼 사이즈
 
 
 // 3. 열거형 정의
@@ -124,7 +128,8 @@
         AVLNode *high_root;                     // Level 0 큐
         LinkedQueue low_queue;                  // Level 1 큐
         WaitQueue wait_queue;                   // WAIT 큐
-        int msqid;                              // 
+        int msqid;                              // 메시지 큐 식별자
+        int dump_fd;                            // schedule_dump.txt 파일 디스크립터
         int running_idx;                        // CPU를 할당받아 실행 중인 프로세스
         int last_cpu_idx;                       // 마지막 CPU 인덱스
         int tick_count;
@@ -455,8 +460,8 @@
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_handler = timer_handler;
+        sa.sa_flags = SA_RESTART; // 시그널 처리 후 msgrcv 등 인터럽트 가능한 시스템 콜 자동 재개
         sigemptyset(&sa.sa_mask);
-        sa.sa_flags = 0;
         if (sigaction(SIGALRM, &sa, NULL) == -1) {
             perror("시그널 핸들러 설정 실패");
             return false;
@@ -538,13 +543,16 @@
     // (2) 자식 -> 부모 메시지 전달
     static void child_process(int child_idx) {
         long my_type = (long)getpid();
-        for (;;) {
+        while(1) {
             Message msg;
-            ssize_t received = msgrcv(scheduler.msqid, &msg, sizeof(msg) - sizeof(long), my_type, 0);
-            if (received == -1) {
-                if (errno == EINTR) continue;
-                _exit(EXIT_FAILURE);
+            ssize_t received;
+
+            while(1){
+                received = msgrcv(scheduler.msqid, &msg, sizeof(msg) - sizeof(long), my_type, 0);
+                if (received == -1 && errno == EINTR) continue;
+                break;
             }
+            if (received == -1) break;
 
             if (msg.child_idx == MSG_STOP)
                 _exit(EXIT_SUCCESS);
@@ -563,14 +571,22 @@
     // (3) 부모의 응답 대기
     static bool wait_for_ack(int expected_idx, int expected_tick) {
         AckMessage ack;
-        for (;;) {
-            ssize_t received = msgrcv(scheduler.msqid, &ack, sizeof(ack) - sizeof(long), 1, 0);
+        ssize_t received;
+
+        while(1) {
+            while(1) {
+                received = msgrcv(scheduler.msqid, &ack, sizeof(ack) - sizeof(long), 1, 0);
+                if (received == -1 && errno == EINTR) continue;
+                break;
+            }
             if (received == -1) {
-                if (errno == EINTR) continue;
                 perror("msgrcv() 응답 대기 오류");
                 return false;
             }
-            if (ack.child_idx == expected_idx && ack.tick == expected_tick) return true;
+
+            if (ack.child_idx == expected_idx && ack.tick == expected_tick) {
+                return true;
+            }
             // 예상치 못한 ACK 또는 오래된 ACK는 무시
         }
     }
@@ -612,7 +628,7 @@
     }
 
     // (2) 에이징 적용
-    static bool apply_aging(void) {
+    static bool apply_aging() {
         ListNode *cur = scheduler.low_queue.head;
 
         while (cur) {
@@ -636,7 +652,7 @@
     }
 
     // (3) 낮은 우선순위 프로세스 선점
-    static bool preempt_low_process(void) {
+    static bool preempt_low_process() {
         // 높은 우선순위 프로세스가 존재할 경우 현재 실행 중인 프로세스를 선점
         if (scheduler.running_idx >= 0 && scheduler.pcb[scheduler.running_idx].priority_level == 1 && scheduler.high_root != NULL) {
             int idx = scheduler.running_idx;
@@ -653,7 +669,7 @@
     }
 
     // (4) CPU를 사용할 프로세스 선택
-    static void dispatch_process(void) {
+    static void dispatch_process() {
         // 실행 중인 프로세스가 있을 경우 취소
         if (scheduler.running_idx != -1) return;
 
@@ -686,7 +702,7 @@
     }
 
     // (6) Level 1 대기 시간 계산
-    static void update_low_waiting(void) {
+    static void update_low_waiting() {
         ListNode *cur = scheduler.low_queue.head;
         while (cur) { // Linked List 끝까지 이동하며 대기 시간 증가 계산
             scheduler.pcb[cur->process_idx].total_waiting_time++;
@@ -695,14 +711,16 @@
     }
 
     // (7) CPU Tick 실행
-    static bool execute_cpu_tick(void) {
+    static bool execute_cpu_tick() {
         // 실행 중인 프로세스가 없을 경우
-        if (scheduler.running_idx < 0) return;
+        if (scheduler.running_idx < 0) return true;
 
         // 자식에게 현재 tick 전달 후 응답 대기
         int idx = scheduler.running_idx;
-        send_message((long)scheduler.pcb[idx].pid, idx, scheduler.tick_count);
-        wait_for_ack(idx, scheduler.tick_count);
+        if (!send_message((long)scheduler.pcb[idx].pid, idx, scheduler.tick_count))
+            return false;
+        if (!wait_for_ack(idx, scheduler.tick_count))
+            return false;
 
         // 자식 프로세스의 응답을 받은 뒤 논리적인 CPU Tick을 반영
         scheduler.pcb[idx].cpu_burst--;
@@ -730,10 +748,104 @@
                 return false;
             }
         }
+        return true;
+    }
+
+    // (7-1) Level 0 AVL 트리 순회하며 문자열 생성 헬퍼 
+    static void dump_high_queue(AVLNode *node, char *buf, size_t max_len) { 
+        // 자식 노드가 존재하지 않으면 반환
+        if (!node) return; 
+
+        // 
+        dump_high_queue(node->left, buf, max_len); 
+        char tmp[CHAR_BUF_SIZE]; // 임시 배열
+        // 과제 명세의 `sprintf`를 차용하되, 큐 덤프 문자열 누적 시 발생할 수 있는 잠재적 버퍼 오버플로우를 방지하기 위해 경계 검사가 포함된 `snprintf`를 적용하여 안전성을 확보
+        // 지정한 크기를 초과하지 않게 문자열 작성
+        snprintf(tmp, sizeof(tmp), "P%d ", node->process_idx); 
+        strncat(buf, tmp, max_len - strlen(buf) - 1); // 문자열 뒤에 새로운 프로세스 문자열 추가
+        dump_high_queue(node->right, buf, max_len); 
+    } 
+
+    // write() 반복 호출 함수
+    static bool write_all(int fd, const char *buf, size_t len) {
+        size_t written = 0;
+
+        while (written < len) {
+            ssize_t n = write(fd, buf + written, len - written);
+
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+
+                perror("write() 오류");
+                return false;
+            }
+
+            if (n == 0)
+                return false;
+
+            written += (size_t)n;
+        }
+
+        return true;
+    }
+    
+    // (7-2) 매 틱 schedule_dump.txt 파일에 기록 (open, write, snprintf 사용) 
+    static void record_dump() { 
+        // 파일이 열려 있지 않으면 반환
+        if (scheduler.dump_fd < 0) return; 
+        char run_str[DUMP_QUEUE_BUF_SIZE] = "";     // Level 0 + Level 1 Queue
+        char wait_str[DUMP_QUEUE_BUF_SIZE] = "";    // Wait-Queue
+        char out_buf[DUMP_OUTPUT_BUF_SIZE] = "";    // 최종 출력 문자열
+
+        // 1. Run-Queue (Level 0 AVL Tree + Level 1 Linked List) 문자열 구성 
+        dump_high_queue(scheduler.high_root, run_str, sizeof(run_str)); // Lvel 0 문자열 생성
+        ListNode *cur = scheduler.low_queue.head; 
+        
+        // Level 1 문자열 생성 : Linked List 순회
+        while (cur) { 
+            char tmp[CHAR_BUF_SIZE]; 
+            snprintf(tmp, sizeof(tmp), "P%d(L1) ", cur->process_idx); 
+            strncat(run_str, tmp, sizeof(run_str) - strlen(run_str) - 1); 
+            cur = cur->next; 
+        } 
+            
+        // 2. Wait-Queue (Circular Array) 문자열 구성 
+        for (int i = 0; i < scheduler.wait_queue.count; i++) { 
+            int q_idx = (scheduler.wait_queue.front + i) % NUM_CHILDREN; 
+            int p_idx = scheduler.wait_queue.data[q_idx]; 
+            char tmp[CHAR_BUF_SIZE]; 
+            snprintf(tmp, sizeof(tmp), "P%d(IO:%d) ", p_idx, scheduler.pcb[p_idx].io_burst); 
+            strncat(wait_str, tmp, sizeof(wait_str) - strlen(wait_str) - 1); 
+        } 
+        
+        // 3. 과제 명세 포맷: (at time t, process pid gets CPU time, remaining CPU-burst) run-queue dump, I/O-queue dump 
+        int r_idx = scheduler.running_idx; 
+        pid_t curr_pid = (r_idx >= 0) ? scheduler.pcb[r_idx].pid : -1; 
+        int curr_process_idx = (r_idx >= 0) ? scheduler.pcb[r_idx].child_idx : -1;
+        int rem_burst = (r_idx >= 0) ? scheduler.pcb[r_idx].cpu_burst : 0; 
+        int len = snprintf(out_buf, sizeof(out_buf), "(at time %d, process %d(P%d) gets CPU time, remaining CPU-burst: %d) Run-Queue: [ %s] / Wait-Queue: [ %s]\n", scheduler.tick_count, (int)curr_pid, curr_process_idx, rem_burst, run_str, wait_str); 
+        
+
+        if (len < 0) {
+            fprintf(stderr, "덤프 문자열 생성 실패\n");
+            return;
+        }
+
+        if ((size_t)len >= sizeof(out_buf)) {
+            fprintf(stderr, "덤프 문자열 버퍼 부족\n");
+            return;
+        }
+        // write() 저수준 시스템 콜 호출 
+        if (len > 0) { 
+            if (!write_all(scheduler.dump_fd, out_buf, (size_t)len)) {
+                fprintf(stderr, "파일 기록 실패\n");
+            } 
+        } 
     }
 
     // (8) 전체 스케줄러 Tick
-    static bool scheduler_tick(void) {
+    static bool scheduler_tick() {
         scheduler.tick_count++;
 
         if (!process_io_queue()) // I/O 작업 수행
@@ -748,9 +860,14 @@
         update_high_waiting(scheduler.high_root);
         update_low_waiting();
 
+        // 매 틱 저수준 파일 덤프 기록 호출 
+        record_dump();
+
         // cpu 실행
         return execute_cpu_tick();
     }
+
+
 
 // 15. 통계 및 메모리 정리 함수 정의
     // (1) 통계 계산
@@ -818,6 +935,15 @@
         avl_free(scheduler.high_root);
         scheduler.high_root = NULL;
         low_free();
+
+        // 파일 디스크립터 정리
+        if (scheduler.dump_fd >= 0) {
+            if (close(scheduler.dump_fd) == -1)
+                perror("close() 오류");
+
+            scheduler.dump_fd = -1;
+        }
+
         if (scheduler.msqid != -1) {
             if (msgctl(scheduler.msqid, IPC_RMID, NULL) == -1)
                 perror("msgctl IPC_RMID 오류");
@@ -849,6 +975,7 @@
 int main() {
     // 스케줄러 값 초기화
     scheduler.msqid = -1;
+    scheduler.dump_fd = -1;
     scheduler.running_idx = -1;
     scheduler.last_cpu_idx = -1;
 
@@ -863,6 +990,15 @@ int main() {
     if (scheduler.msqid == -1) {
         perror("msgget 오류");
         return 1;
+    }
+
+    // 저수준 시스템 콜 open()으로 schedule_dump.txt 생성 
+    // schedule_dump.txt 파일을 쓰기 전용(O_WRONLY)으로 연다. 
+    // 파일이 없으면 새로 생성(O_CREAT)하고, 이미 존재하면 내용을 0바이트로 초기화(O_TRUNC)한다. 
+    // 파일 권한은 0644(소유자 읽기/쓰기, 그룹/기타 읽기)로 설정한다.
+    scheduler.dump_fd = open("schedule_dump.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644); 
+    if (scheduler.dump_fd == -1) { 
+        perror("open(schedule_dump.txt) 오류"); // 파일 열기 실패 시에도 시뮬레이션은 계속 진행 가능 
     }
 
     // PCB 초기화 및 자식 프로세스 Level 0 삽입
@@ -921,6 +1057,7 @@ int main() {
             return EXIT_FAILURE;
         }
         if (!scheduler_tick()) {  // 스케줄러 틱 오류 발생 시 종료
+            perror("[상세 에러 원인]");
             fprintf(stderr, "오류로 인해 스케줄러 동작 멈춤\n");
             stop_timer();
             cleanup_error(created_children);
@@ -934,6 +1071,7 @@ int main() {
     stop_children();
     // 스케줄러 통계 지표 출력
     print_statistics();
+
     // 메모리 정리
     cleanup();
 
